@@ -4,8 +4,6 @@ from openai import OpenAI
 
 app = Flask(__name__)
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-
 @app.route("/", methods=["GET"])
 def health_check():
     return "Translator service running", 200
@@ -13,47 +11,44 @@ def health_check():
 
 @app.route("/translate", methods=["POST"])
 def translate():
-    data = request.json
+    api_key = os.environ.get("OPENAI_API_KEY")
 
-    member = data.get("member")
-    text = data.get("text")
+    if not api_key:
+        return jsonify({"error": "OPENAI_API_KEY not set"}), 500
 
-    if not member or not text:
-        return jsonify({"error": "member and text are required"}), 400
+    client = OpenAI(api_key=api_key)
 
-    prompt = f"""
-You are a professional translator.
+    data = request.json or {}
+    author = data.get("author", "Unknown")
+    text = data.get("text", "")
+    target_languages = data.get("languages", ["en", "fr", "es"])
 
-Original message from member: {member}
+    if not text:
+        return jsonify({"error": "No text provided"}), 400
 
-Text:
-{text}
+    translations = {}
 
-Return the result in JSON with this structure:
-{{
-  "member": "{member}",
-  "original": "{text}",
-  "translations": {{
-    "fr": "...",
-    "en": "...",
-    "es": "...",
-    "fa": "..."
-  }}
-}}
-"""
+    for lang in target_languages:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"You are a professional translator. Translate the text into {lang}."
+                },
+                {
+                    "role": "user",
+                    "content": text
+                }
+            ]
+        )
+        translations[lang] = response.choices[0].message.content.strip()
 
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": "You translate text accurately."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.2
-    )
-
-    result = response.choices[0].message.content
-
-    return jsonify({"result": result})
+    return jsonify({
+        "author": author,
+        "original_text": text,
+        "translations": translations
+    })
 
 
 if __name__ == "__main__":
