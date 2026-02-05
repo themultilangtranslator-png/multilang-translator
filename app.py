@@ -46,12 +46,10 @@ def _cache_get(key: str):
 def _cache_set(key: str, payload: dict):
     if CACHE_TTL_SECONDS <= 0:
         return
-
     if len(CACHE) >= CACHE_MAX_ITEMS:
         cutoff = int(CACHE_MAX_ITEMS * 0.1) or 1
         for k in list(CACHE.keys())[:cutoff]:
             CACHE.pop(k, None)
-
     CACHE[key] = (_now() + CACHE_TTL_SECONDS, payload)
 
 
@@ -63,12 +61,10 @@ def _build_line_text(author: str, original_text: str, detected_language: str, tr
     lines.append("Original:")
     lines.append(original_text)
     lines.append("")
-
     for lang in ordered_langs:
         lines.append(f"[{lang}]")
         lines.append(translations.get(lang, ""))
         lines.append("")
-
     return "\n".join(lines).strip()
 
 
@@ -133,23 +129,37 @@ def translate():
         return jsonify(cached), 200
 
     # -------------------------
-    # OPENAI PROMPT (INTERPRÉTATION INTELLIGENTE)
+    # OPENAI PROMPT (GARDE-FOUS GÉNÉRIQUES & SCALABLES)
     # -------------------------
     system_prompt = {
         "role": "system",
         "content": (
             "You are a professional multilingual interpreter, not a literal translator. "
             "Your task is to convey meaning, intent, and tone accurately.\n\n"
-            "Guidelines:\n"
+
+            "Core principles:\n"
             "- Do NOT translate word-for-word.\n"
             "- Correct grammatical mistakes, typos, and awkward phrasing.\n"
             "- Adapt idioms, slang, and regional expressions naturally.\n"
-            "- Take cultural and geographic language differences into account.\n"
-            "- If a sentence is poorly written, improve it slightly so it is clear and natural.\n"
-            "- Preserve the original meaning and intent at all times.\n"
-            "- Match the original register (casual, friendly, neutral).\n"
             "- Use natural, idiomatic language in the target language.\n"
             "- Use proper capitalization and punctuation.\n\n"
+
+            "Quality & meaning safeguards:\n"
+            "- Always prioritize meaning and real-world plausibility over literal wording.\n"
+            "- Infer the most likely intent and context before translating (chat, informal, operational, etc.).\n"
+            "- If a word or phrase is ambiguous, choose the interpretation that best fits the inferred context.\n"
+            "- Do not upgrade or downgrade formality unless explicitly indicated.\n"
+            "- Do not change the scenario type (e.g., do not turn a casual action into a formal event).\n"
+            "- Preserve tense and aspect (ongoing vs future; entering vs going).\n"
+            "- Translate the meaning of idioms and slang, not the words.\n"
+            "- If the source is poorly written, improve it minimally for clarity while preserving intent.\n"
+            "- If ambiguity remains, resolve it using the most conservative, context-consistent interpretation.\n\n"
+
+            "Fidelity control:\n"
+            "- Never introduce new facts.\n"
+            "- Never remove meaningful information.\n"
+            "- If rephrasing is needed, keep the same intent and approximate length.\n\n"
+
             "Output rules:\n"
             "- Detect the source language automatically.\n"
             "- Return ONLY valid JSON.\n"
