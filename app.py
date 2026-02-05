@@ -1,13 +1,10 @@
-import os
-import json
 from flask import Flask, request, jsonify
+import os
 from openai import OpenAI
 
 app = Flask(__name__)
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-TARGET_LANGS = ["fr", "en", "es", "it"]
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 @app.route("/", methods=["GET"])
 def health_check():
@@ -16,53 +13,47 @@ def health_check():
 
 @app.route("/translate", methods=["POST"])
 def translate():
-    data = request.get_json(silent=True) or {}
+    data = request.json
 
     member = data.get("member")
     text = data.get("text")
 
     if not member or not text:
-        return jsonify({
-            "error": "member and text are required"
-        }), 400
+        return jsonify({"error": "member and text are required"}), 400
 
     prompt = f"""
 You are a professional translator.
 
-Return ONLY valid JSON in the following format:
+Original message from member: {member}
 
+Text:
+{text}
+
+Return the result in JSON with this structure:
 {{
   "member": "{member}",
-  "original_text": "{text}",
-  "detected_language": "<language>",
+  "original": "{text}",
   "translations": {{
-    "fr": "<french>",
-    "en": "<english>",
-    "es": "<spanish>",
-    "it": "<italian>"
+    "fr": "...",
+    "en": "...",
+    "es": "...",
+    "fa": "..."
   }}
 }}
-
-Rules:
-- Keep the original text unchanged.
-- Detect the language automatically.
-- Do NOT translate into the detected language.
 """
 
-    response = client.responses.create(
-        model="gpt-5",
-        input=prompt
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": "You translate text accurately."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.2
     )
 
-    try:
-        result = json.loads(response.output_text)
-    except Exception:
-        return jsonify({
-            "error": "Invalid AI response",
-            "raw": response.output_text
-        }), 500
+    result = response.choices[0].message.content
 
-    return jsonify(result), 200
+    return jsonify({"result": result})
 
 
 if __name__ == "__main__":
