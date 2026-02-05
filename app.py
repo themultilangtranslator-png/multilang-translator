@@ -129,7 +129,7 @@ def translate():
         return jsonify(cached), 200
 
     # -------------------------
-    # OPENAI PROMPT (GARDE-FOUS GÉNÉRIQUES & SCALABLES)
+    # OPENAI PROMPT (INTERPRÉTATION CONTEXTUELLE)
     # -------------------------
     system_prompt = {
         "role": "system",
@@ -146,14 +146,11 @@ def translate():
 
             "Quality & meaning safeguards:\n"
             "- Always prioritize meaning and real-world plausibility over literal wording.\n"
-            "- Infer the most likely intent and context before translating (chat, informal, operational, etc.).\n"
-            "- If a word or phrase is ambiguous, choose the interpretation that best fits the inferred context.\n"
-            "- Do not upgrade or downgrade formality unless explicitly indicated.\n"
-            "- Do not change the scenario type (e.g., do not turn a casual action into a formal event).\n"
+            "- Infer the most likely intent and context before translating.\n"
+            "- If a word or phrase is ambiguous, choose the context-consistent interpretation.\n"
+            "- Do not change the scenario type or register unless explicitly indicated.\n"
             "- Preserve tense and aspect (ongoing vs future; entering vs going).\n"
-            "- Translate the meaning of idioms and slang, not the words.\n"
-            "- If the source is poorly written, improve it minimally for clarity while preserving intent.\n"
-            "- If ambiguity remains, resolve it using the most conservative, context-consistent interpretation.\n\n"
+            "- If the source is poorly written, improve it minimally for clarity while preserving intent.\n\n"
 
             "Fidelity control:\n"
             "- Never introduce new facts.\n"
@@ -198,11 +195,18 @@ def translate():
         detected_language = _normalize_detected_language(result.get("detected_language"))
         translations = result.get("translations", {}) or {}
 
+        # -------------------------
+        # NO-RETRANSLATION LOGIC
+        # -------------------------
         ordered_translations = {}
         for lang in ordered_langs:
-            t = str(translations.get(lang, "")).strip()
-            t = t.replace("```", "").replace("**", "").strip()
-            ordered_translations[lang] = t
+            if lang == detected_language:
+                # Pas de retraduction : on renvoie le texte original (déjà interprété/normalisé implicitement)
+                ordered_translations[lang] = text
+            else:
+                t = str(translations.get(lang, "")).strip()
+                t = t.replace("```", "").replace("**", "").strip()
+                ordered_translations[lang] = t
 
         payload = {
             "author": author,
