@@ -54,6 +54,7 @@ def _cache_set(key: str, payload: dict):
 
 
 def _build_line_text(author: str, original_text: str, detected_language: str, translations: dict, ordered_langs: list[str]) -> str:
+    # Format prêt à coller dans LINE / WhatsApp
     lines = []
     lines.append(f"Author: {author}")
     lines.append(f"Detected: {detected_language}")
@@ -61,10 +62,12 @@ def _build_line_text(author: str, original_text: str, detected_language: str, tr
     lines.append("Original:")
     lines.append(original_text)
     lines.append("")
+
     for lang in ordered_langs:
         lines.append(f"[{lang}]")
         lines.append(translations.get(lang, ""))
         lines.append("")
+
     return "\n".join(lines).strip()
 
 
@@ -135,7 +138,7 @@ def translate():
         "role": "system",
         "content": (
             "You are a professional multilingual interpreter, not a literal translator. "
-            "Your task is to convey meaning, intent, and tone accurately.\n\n"
+            "Your task is to convey meaning, intent, and tone accurately across languages.\n\n"
 
             "Core principles:\n"
             "- Do NOT translate word-for-word.\n"
@@ -146,11 +149,14 @@ def translate():
 
             "Quality & meaning safeguards:\n"
             "- Always prioritize meaning and real-world plausibility over literal wording.\n"
-            "- Infer the most likely intent and context before translating.\n"
-            "- If a word or phrase is ambiguous, choose the context-consistent interpretation.\n"
-            "- Do not change the scenario type or register unless explicitly indicated.\n"
+            "- Infer the most likely intent and context before translating (chat, informal, operational, etc.).\n"
+            "- If a word or phrase is ambiguous, choose the interpretation that best fits the inferred context.\n"
+            "- Do not upgrade or downgrade formality unless explicitly indicated.\n"
+            "- Do not change the scenario type (do not turn a casual action into a formal event).\n"
             "- Preserve tense and aspect (ongoing vs future; entering vs going).\n"
-            "- If the source is poorly written, improve it minimally for clarity while preserving intent.\n\n"
+            "- Translate the meaning of idioms and slang, not the words.\n"
+            "- If the source is poorly written, improve it minimally for clarity while preserving intent.\n"
+            "- If ambiguity remains, resolve it using the most conservative, context-consistent interpretation.\n\n"
 
             "Fidelity control:\n"
             "- Never introduce new facts.\n"
@@ -196,12 +202,12 @@ def translate():
         translations = result.get("translations", {}) or {}
 
         # -------------------------
-        # NO-RETRANSLATION LOGIC
+        # OPTIMISATION #3 : PAS DE RETRADUCTION DE LA LANGUE SOURCE
         # -------------------------
         ordered_translations = {}
         for lang in ordered_langs:
             if lang == detected_language:
-                # Pas de retraduction : on renvoie le texte original (déjà interprété/normalisé implicitement)
+                # On renvoie le texte original tel quel (zéro retraduction)
                 ordered_translations[lang] = text
             else:
                 t = str(translations.get(lang, "")).strip()
