@@ -8,48 +8,43 @@ app = Flask(__name__)
 def health_check():
     return "Translator service running", 200
 
-
 @app.route("/translate", methods=["POST"])
 def translate():
-    api_key = os.environ.get("OPENAI_API_KEY")
+    try:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            return jsonify({"error": "OPENAI_API_KEY not set"}), 500
 
-    if not api_key:
-        return jsonify({"error": "OPENAI_API_KEY not set"}), 500
+        client = OpenAI(api_key=api_key)
 
-    client = OpenAI(api_key=api_key)
+        data = request.get_json(force=True)
+        author = data.get("author", "Unknown")
+        text = data.get("text", "")
+        target_languages = data.get("languages", ["en", "fr", "es"])
 
-    data = request.json or {}
-    author = data.get("author", "Unknown")
-    text = data.get("text", "")
-    target_languages = data.get("languages", ["en", "fr", "es"])
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
 
-    if not text:
-        return jsonify({"error": "No text provided"}), 400
+        translations = {}
 
-    translations = {}
+        for lang in target_languages:
+            resp = client.responses.create(
+                model="gpt-4o-mini",
+                input=f"Translate the following text into {lang}:\n{text}"
+            )
+            translations[lang] = resp.output_text
 
-    for lang in target_languages:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"You are a professional translator. Translate the text into {lang}."
-                },
-                {
-                    "role": "user",
-                    "content": text
-                }
-            ]
-        )
-        translations[lang] = response.choices[0].message.content.strip()
+        return jsonify({
+            "author": author,
+            "original_text": text,
+            "translations": translations
+        }), 200
 
-    return jsonify({
-        "author": author,
-        "original_text": text,
-        "translations": translations
-    })
-
+    except Exception as e:
+        return jsonify({
+            "error": "internal_error",
+            "details": str(e)
+        }), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
