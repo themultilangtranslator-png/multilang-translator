@@ -13,7 +13,8 @@ app = Flask(__name__)
 # -------------------------
 # CONFIG
 # -------------------------
-DEFAULT_LANGS = ["en", "fr", "es", "it"]
+# ✅ Added Persian/Farsi (Parsi) = "fa"
+DEFAULT_LANGS = ["en", "fr", "es", "it", "fa"]
 MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "86400"))  # 24h
@@ -81,22 +82,38 @@ def _profile_cache_set(user_id: str, profile: dict):
     PROFILE_CACHE[user_id] = (_now() + PROFILE_CACHE_TTL_SECONDS, profile)
 
 
+# ✅ New format: flags + no empty lines + supports "fa"
 def _build_line_text(author: str, original_text: str, detected_language: str, translations: dict, ordered_langs: list[str]) -> str:
-    # Format prêt à coller dans LINE / WhatsApp
+    flag_map = {
+        "en": "🇺🇸",
+        "fr": "🇫🇷",
+        "es": "🇪🇸",
+        "it": "🇮🇹",
+        "fa": "🇮🇷",  # ✅ Persian/Farsi (Parsi)
+        "pt": "🇵🇹",
+        "de": "🇩🇪",
+        "nl": "🇳🇱",
+        "ar": "🇸🇦",
+        "ja": "🇯🇵",
+        "ko": "🇰🇷",
+        "zh": "🇨🇳",
+        "ru": "🇷🇺",
+    }
+
+    def clean(s: str) -> str:
+        return (s or "").replace("\n", " ").replace("\r", " ").strip()
+
     lines = []
-    lines.append(f"Author: {author}")
-    lines.append(f"Detected: {detected_language}")
-    lines.append("")
-    lines.append("Original:")
-    lines.append(original_text)
-    lines.append("")
+    lines.append(f"👤 {clean(author)}")
+    lines.append(f"🌐 {clean(detected_language)}")
+    lines.append(f"📝 {clean(original_text)}")
 
     for lang in ordered_langs:
-        lines.append(f"[{lang}]")
-        lines.append(translations.get(lang, ""))
-        lines.append("")
+        flag = flag_map.get(lang.lower(), f"🏳️({lang})")
+        text = clean(translations.get(lang, ""))
+        lines.append(f"{flag} {text}")
 
-    return "\n".join(lines).strip()
+    return "\n".join(lines)
 
 
 # -------------------------
@@ -112,8 +129,8 @@ def verify_line_signature(raw_body: bytes, signature: str, channel_secret: str) 
 
 def get_line_profile(user_id: str) -> dict:
     """
-    Retourne le profil LINE (displayName, pictureUrl, statusMessage)
-    ou {} si impossible. Inclut un cache pour limiter les appels.
+    Returns LINE profile (displayName, pictureUrl, statusMessage)
+    Cached to reduce API calls.
     """
     if not user_id:
         return {}
@@ -153,7 +170,7 @@ def reply_to_line(reply_token: str, text: str) -> bool:
     }
     payload = {
         "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text[:4900]}],  # marge sécurité
+        "messages": [{"type": "text", "text": text[:4900]}],  # safety margin
     }
 
     try:
@@ -173,15 +190,11 @@ def translate_core(author: str, text: str, ordered_langs: list[str], include_lin
 
     client = OpenAI(api_key=api_key)
 
-    # Cache (sur author+text+langs)
     cache_key = _make_cache_key(author, text, ordered_langs)
     cached = _cache_get(cache_key)
     if cached:
         return cached
 
-    # PROMPT: évite les traductions mot-à-mot, corrige le message si nécessaire,
-    # respecte le registre (chat), tient compte d’expressions et régionalismes,
-    # et retourne un JSON strict.
     prompt = {
         "role": "user",
         "content": (
@@ -219,12 +232,10 @@ def translate_core(author: str, text: str, ordered_langs: list[str], include_lin
     )
     raw = (resp.choices[0].message.content or "").strip()
 
-    # Parse JSON robuste
     result = json.loads(raw)
     detected_language = str(result.get("detected_language", "unknown")).strip()
     translations = result.get("translations", {}) or {}
 
-    # Assure ordre + clés
     ordered_translations = {lang: str(translations.get(lang, "")).strip() for lang in ordered_langs}
 
     payload = {
@@ -263,7 +274,6 @@ def translate():
     if not text:
         return jsonify({"error": "No text provided"}), 400
 
-    # Normalisation languages (conserve l’ordre)
     if not isinstance(languages, list) or not all(isinstance(x, str) for x in languages):
         return jsonify({"error": "languages must be a list of strings"}), 400
     ordered_langs = [x.strip() for x in languages if x and x.strip()]
@@ -317,7 +327,6 @@ def webhook():
             user_id = (event.get("source", {}) or {}).get("userId", "")
             profile = get_line_profile(user_id)
 
-            # ✅ NICKNAME (displayName) au lieu de l’ID
             author = profile.get("displayName") or (f"User-{user_id[-4:]}" if user_id else "Unknown")
 
             text = (message.get("text") or "").strip()
@@ -333,7 +342,6 @@ def webhook():
             reply_to_line(reply_token, line_text)
 
         except Exception:
-            # Ne bloque pas le traitement des autres events
             continue
 
     return "OK", 200
