@@ -53,20 +53,36 @@ def _cache_set(key: str, payload: dict):
     CACHE[key] = (_now() + CACHE_TTL_SECONDS, payload)
 
 
-def _build_line_text(author: str, original_text: str, detected_language: str, translations: dict, ordered_langs: list[str]) -> str:
-    # Format prêt à coller dans LINE / WhatsApp
+def _build_line_text(author: str, original_text: str, detected_language: str,
+                     translations: dict, ordered_langs: list[str]) -> str:
+    """
+    Format compact "option 2" prêt à poster dans LINE / WhatsApp.
+    - Affiche: Nom + langue détectée + drapeau
+    - Affiche le texte original
+    - Affiche ensuite les traductions avec emojis
+    - Masque la langue source (pas de doublon)
+    """
+    flag_map = {
+        "en": "🇬🇧",
+        "fr": "🇫🇷",
+        "es": "🇪🇸",
+        "it": "🇮🇹",
+        "fa": "🇮🇷",
+    }
+
     lines = []
-    lines.append(f"Author: {author}")
-    lines.append(f"Detected: {detected_language}")
-    lines.append("")
-    lines.append("Original:")
+    flag = flag_map.get(detected_language, "")
+    lines.append(f"{author} ({detected_language.upper()} {flag})")
     lines.append(original_text)
     lines.append("")
 
     for lang in ordered_langs:
-        lines.append(f"[{lang}]")
-        lines.append(translations.get(lang, ""))
-        lines.append("")
+        if lang == detected_language:
+            continue  # ne pas afficher la langue source
+        emoji = flag_map.get(lang, "")
+        t = translations.get(lang, "")
+        if t:
+            lines.append(f"{emoji} {t}".strip())
 
     return "\n".join(lines).strip()
 
@@ -207,7 +223,6 @@ def translate():
         ordered_translations = {}
         for lang in ordered_langs:
             if lang == detected_language:
-                # On renvoie le texte original tel quel (zéro retraduction)
                 ordered_translations[lang] = text
             else:
                 t = str(translations.get(lang, "")).strip()
