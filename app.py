@@ -49,7 +49,6 @@ def _cache_set(key: str, payload: dict):
 
     # Éviction simple si le cache grossit trop
     if len(CACHE) >= CACHE_MAX_ITEMS:
-        # Supprime ~10% des plus anciens/expirés
         cutoff = int(CACHE_MAX_ITEMS * 0.1) or 1
         for k in list(CACHE.keys())[:cutoff]:
             CACHE.pop(k, None)
@@ -59,7 +58,6 @@ def _cache_set(key: str, payload: dict):
 
 def _build_line_text(author: str, original_text: str, detected_language: str, translations: dict, ordered_langs: list[str]) -> str:
     # Format prêt à coller dans LINE / WhatsApp
-    # (tu peux ajuster la mise en page plus tard, mais ça reste stable et lisible)
     lines = []
     lines.append(f"Author: {author}")
     lines.append(f"Detected: {detected_language}")
@@ -74,6 +72,25 @@ def _build_line_text(author: str, original_text: str, detected_language: str, tr
         lines.append("")
 
     return "\n".join(lines).strip()
+
+
+def _normalize_detected_language(value: str) -> str:
+    v = (value or "").strip().lower()
+    # Tolérance: "spanish" -> "es", "french" -> "fr", etc.
+    mapping = {
+        "english": "en",
+        "french": "fr",
+        "spanish": "es",
+        "italian": "it",
+        "persian": "fa",
+        "farsi": "fa",
+    }
+    if v in mapping:
+        return mapping[v]
+    # Si ça ressemble déjà à un code ISO
+    if len(v) in (2, 3):
+        return v
+    return "unknown"
 
 
 # -------------------------
@@ -100,7 +117,6 @@ def translate():
     text = (data.get("text") or "").strip()
     languages = data.get("languages") or DEFAULT_LANGS
 
-    # Option : inclure un flag pour récupérer un bloc prêt à coller
     include_line_text = bool(data.get("include_line_text", True))
 
     if not text:
@@ -109,8 +125,8 @@ def translate():
     # Normalisation languages (conserve l’ordre)
     if not isinstance(languages, list) or not all(isinstance(x, str) for x in languages):
         return jsonify({"error": "languages must be a list of strings"}), 400
-    ordered_langs = [x.strip() for x in languages if x and x.strip()]
 
+    ordered_langs = [x.strip().lower() for x in languages if x and x.strip()]
     if not ordered_langs:
         ordered_langs = DEFAULT_LANGS
 
@@ -121,47 +137,63 @@ def translate():
         return jsonify(cached), 200
 
     # --------------- OPENAI ---------------
-    # Un seul appel : détecter la langue + traduire vers N langues.
-    # Le modèle doit retourner un JSON strict.
+    # Objectif: 1 seul appel, JSON strict, traduction naturelle (capitalisation/ponctuation),
+    # sans markdown ni texte additionnel.
     prompt = {
+        "role": "system",
+        "content": (
+            "You are a professional translator. "
+            "Detect the source language automatically. "
+            "Return a natural, idiomatic translation in each target language. "
+            "Keep the same tone, do not add explanations. "
+            "Use proper capitalization and punctuation. "
+            "Return ONLY valid JSON (no markdown, no code fences, no extra text)."
+        )
+    }
+
+    user_msg = {
         "role": "user",
         "content": (
-            "You are a professional translation engine.\n"
-            "Task:\n"
-            "1) Detect the language of the input text.\n"
-            "2) Translate the text into each target language code provided.\n\n"
-            "Rules:\n"
-            "- Return ONLY valid JSON.\n"
-            "- No markdown, no code fences, no extra text.\n"
-            "- Keep meaning, tone, emojis.\n"
-            "- Do not add commentary.\n\n"
             f"Target languages (in order): {ordered_langs}\n"
-            f"Text: {text}\n\n"
-            "Return this JSON schema:\n"
+            f"Text:\n{text}\n\n"
+            "Return this exact JSON schema:\n"
             "{\n"
-            '  "detected_language": "<language_code_or_name>",\n'
+            '  "detected_language": "<iso_code>",\n'
             '  "translations": {\n'
-            '     "<lang>": "<translated_text>",\n'
-            '     "...": "..." \n'
+            '    "en": "...",\n'
+            '    "fr": "...",\n'
+            '    "es": "...",\n'
+            '    "it": "..." \n'
             "  }\n"
             "}\n"
+            "Rules:\n"
+            "- detected_language MUST be a 2-letter ISO code when possible (en/fr/es/it/fa).\n"
+            "- translations keys MUST match the provided target languages list.\n"
+            "- Output MUST be valid JSON only."
         )
     }
 
     try:
         resp = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=[prompt],
+            messages=[prompt, user_msg],
         )
+
         raw = (resp.choices[0].message.content or "").strip()
 
-        # Parse JSON robuste
+        # Parse JSON
         result = json.loads(raw)
-        detected_language = str(result.get("detected_language", "unknown")).strip()
+
+        detected_language = _normalize_detected_language(str(result.get("detected_language", "unknown")))
         translations = result.get("translations", {}) or {}
 
-        # Assure que l’ordre est respecté et que toutes les clés existent
-        ordered_translations = {lang: str(translations.get(lang, "")).strip() for lang in ordered_langs}
+        # Respecter l’ordre et forcer la présence des clés demandées
+        ordered_translations = {}
+        for lang in ordered_langs:
+            t = str(translations.get(lang, "")).strip()
+            # Nettoyage minimal au cas où
+            t = t.replace("```", "").replace("**", "").strip()
+            ordered_translations[lang] = t
 
         payload = {
             "author": author,
@@ -180,6 +212,7 @@ def translate():
         return jsonify({
             "error": "internal_error",
             "details": "OpenAI response was not valid JSON",
+            "raw": raw[:500] if 'raw' in locals() else ""
         }), 500
 
     except Exception as e:
