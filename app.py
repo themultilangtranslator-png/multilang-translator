@@ -1,0 +1,1 @@
+print("Translator service starting...")
