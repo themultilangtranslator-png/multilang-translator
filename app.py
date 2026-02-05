@@ -15,7 +15,7 @@ MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "86400"))  # 24h
 CACHE_MAX_ITEMS = int(os.environ.get("CACHE_MAX_ITEMS", "2000"))
 
-# Simple cache in-memory : {cache_key: (expires_at, payload_dict)}
+# Cache in-memory : {cache_key: (expires_at, payload_dict)}
 CACHE = {}
 
 
@@ -47,7 +47,6 @@ def _cache_set(key: str, payload: dict):
     if CACHE_TTL_SECONDS <= 0:
         return
 
-    # Éviction simple si le cache grossit trop
     if len(CACHE) >= CACHE_MAX_ITEMS:
         cutoff = int(CACHE_MAX_ITEMS * 0.1) or 1
         for k in list(CACHE.keys())[:cutoff]:
@@ -57,7 +56,6 @@ def _cache_set(key: str, payload: dict):
 
 
 def _build_line_text(author: str, original_text: str, detected_language: str, translations: dict, ordered_langs: list[str]) -> str:
-    # Format prêt à coller dans LINE / WhatsApp
     lines = []
     lines.append(f"Author: {author}")
     lines.append(f"Detected: {detected_language}")
@@ -76,7 +74,6 @@ def _build_line_text(author: str, original_text: str, detected_language: str, tr
 
 def _normalize_detected_language(value: str) -> str:
     v = (value or "").strip().lower()
-    # Tolérance: "spanish" -> "es", "french" -> "fr", etc.
     mapping = {
         "english": "en",
         "french": "fr",
@@ -87,7 +84,6 @@ def _normalize_detected_language(value: str) -> str:
     }
     if v in mapping:
         return mapping[v]
-    # Si ça ressemble déjà à un code ISO
     if len(v) in (2, 3):
         return v
     return "unknown"
@@ -116,13 +112,11 @@ def translate():
     author = data.get("author", "Unknown")
     text = (data.get("text") or "").strip()
     languages = data.get("languages") or DEFAULT_LANGS
-
     include_line_text = bool(data.get("include_line_text", True))
 
     if not text:
         return jsonify({"error": "No text provided"}), 400
 
-    # Normalisation languages (conserve l’ordre)
     if not isinstance(languages, list) or not all(isinstance(x, str) for x in languages):
         return jsonify({"error": "languages must be a list of strings"}), 400
 
@@ -130,28 +124,41 @@ def translate():
     if not ordered_langs:
         ordered_langs = DEFAULT_LANGS
 
-    # --------------- CACHE ---------------
+    # -------------------------
+    # CACHE
+    # -------------------------
     cache_key = _make_cache_key(author, text, ordered_langs)
     cached = _cache_get(cache_key)
     if cached:
         return jsonify(cached), 200
 
-    # --------------- OPENAI ---------------
-    # Objectif: 1 seul appel, JSON strict, traduction naturelle (capitalisation/ponctuation),
-    # sans markdown ni texte additionnel.
-    prompt = {
+    # -------------------------
+    # OPENAI PROMPT (INTERPRÉTATION INTELLIGENTE)
+    # -------------------------
+    system_prompt = {
         "role": "system",
         "content": (
-            "You are a professional translator. "
-            "Detect the source language automatically. "
-            "Return a natural, idiomatic translation in each target language. "
-            "Keep the same tone, do not add explanations. "
-            "Use proper capitalization and punctuation. "
-            "Return ONLY valid JSON (no markdown, no code fences, no extra text)."
+            "You are a professional multilingual interpreter, not a literal translator. "
+            "Your task is to convey meaning, intent, and tone accurately.\n\n"
+            "Guidelines:\n"
+            "- Do NOT translate word-for-word.\n"
+            "- Correct grammatical mistakes, typos, and awkward phrasing.\n"
+            "- Adapt idioms, slang, and regional expressions naturally.\n"
+            "- Take cultural and geographic language differences into account.\n"
+            "- If a sentence is poorly written, improve it slightly so it is clear and natural.\n"
+            "- Preserve the original meaning and intent at all times.\n"
+            "- Match the original register (casual, friendly, neutral).\n"
+            "- Use natural, idiomatic language in the target language.\n"
+            "- Use proper capitalization and punctuation.\n\n"
+            "Output rules:\n"
+            "- Detect the source language automatically.\n"
+            "- Return ONLY valid JSON.\n"
+            "- No markdown, no quotes, no explanations.\n"
+            "- Do not mention corrections or improvements.\n"
         )
     }
 
-    user_msg = {
+    user_prompt = {
         "role": "user",
         "content": (
             f"Target languages (in order): {ordered_langs}\n"
@@ -163,35 +170,27 @@ def translate():
             '    "en": "...",\n'
             '    "fr": "...",\n'
             '    "es": "...",\n'
-            '    "it": "..." \n'
+            '    "it": "..."\n'
             "  }\n"
             "}\n"
-            "Rules:\n"
-            "- detected_language MUST be a 2-letter ISO code when possible (en/fr/es/it/fa).\n"
-            "- translations keys MUST match the provided target languages list.\n"
-            "- Output MUST be valid JSON only."
         )
     }
 
     try:
         resp = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=[prompt, user_msg],
+            messages=[system_prompt, user_prompt],
         )
 
         raw = (resp.choices[0].message.content or "").strip()
-
-        # Parse JSON
         result = json.loads(raw)
 
-        detected_language = _normalize_detected_language(str(result.get("detected_language", "unknown")))
+        detected_language = _normalize_detected_language(result.get("detected_language"))
         translations = result.get("translations", {}) or {}
 
-        # Respecter l’ordre et forcer la présence des clés demandées
         ordered_translations = {}
         for lang in ordered_langs:
             t = str(translations.get(lang, "")).strip()
-            # Nettoyage minimal au cas où
             t = t.replace("```", "").replace("**", "").strip()
             ordered_translations[lang] = t
 
@@ -203,7 +202,9 @@ def translate():
         }
 
         if include_line_text:
-            payload["line_text"] = _build_line_text(author, text, detected_language, ordered_translations, ordered_langs)
+            payload["line_text"] = _build_line_text(
+                author, text, detected_language, ordered_translations, ordered_langs
+            )
 
         _cache_set(cache_key, payload)
         return jsonify(payload), 200
