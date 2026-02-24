@@ -13,8 +13,8 @@ app = Flask(__name__)
 # -------------------------
 # CONFIG
 # -------------------------
-# ✅ Active languages: English, French, Spanish, Italian, Persian(Farsi), German
-DEFAULT_LANGS = ["en", "fr", "es", "it", "fa", "de"]
+# ✅ Active languages (default): EN, FR, ES, IT, FA
+DEFAULT_LANGS = ["en", "fr", "es", "it", "fa"]
 MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "86400"))  # 24h
@@ -82,16 +82,22 @@ def _profile_cache_set(user_id: str, profile: dict):
     PROFILE_CACHE[user_id] = (_now() + PROFILE_CACHE_TTL_SECONDS, profile)
 
 
-# ✅ New format: flags + no empty lines + supports fa + de
-def _build_line_text(author: str, original_text: str, detected_language: str, translations: dict, ordered_langs: list[str]) -> str:
+# ✅ LINE text formatter: flags + no empty lines
+def _build_line_text(
+    author: str,
+    original_text: str,
+    detected_language: str,
+    translations: dict,
+    ordered_langs: list[str],
+) -> str:
     flag_map = {
         "en": "🇺🇸",
         "fr": "🇫🇷",
         "es": "🇪🇸",
         "it": "🇮🇹",
         "fa": "🇮🇷",  # ✅ Persian/Farsi (Parsi)
-        "de": "🇩🇪",  # ✅ German
         "pt": "🇵🇹",
+        "de": "🇩🇪",
         "nl": "🇳🇱",
         "ar": "🇸🇦",
         "ja": "🇯🇵",
@@ -113,6 +119,7 @@ def _build_line_text(author: str, original_text: str, detected_language: str, tr
         text = clean(translations.get(lang, ""))
         lines.append(f"{flag} {text}")
 
+    # IMPORTANT: no blank lines, only one \n between useful lines
     return "\n".join(lines)
 
 
@@ -276,6 +283,7 @@ def translate():
 
     if not isinstance(languages, list) or not all(isinstance(x, str) for x in languages):
         return jsonify({"error": "languages must be a list of strings"}), 400
+
     ordered_langs = [x.strip() for x in languages if x and x.strip()]
     if not ordered_langs:
         ordered_langs = DEFAULT_LANGS
@@ -314,4 +322,20 @@ def webhook():
     except Exception:
         return "Bad request", 400
 
-    events
+    # ✅ FIX: define events before using it
+    events = body.get("events", []) or []
+
+    for event in events:
+        try:
+            if event.get("type") != "message":
+                continue
+
+            message = event.get("message", {}) or {}
+            if message.get("type") != "text":
+                continue
+
+            user_id = (event.get("source", {}) or {}).get("userId", "")
+            profile = get_line_profile(user_id)
+
+            # ✅ Nickname (displayName)
+            author = profile.get("displayName")
