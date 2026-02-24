@@ -6,15 +6,15 @@ import hashlib
 import hmac
 import base64
 import requests
-from threading import Thread
 from openai import OpenAI
+from threading import Thread
 
 app = Flask(__name__)
 
 # -------------------------
 # CONFIG
 # -------------------------
-# ✅ Added Persian/Farsi (Parsi) = "fa"
+# ✅ Langues actives (dont Persan/Farsi = "fa")
 DEFAULT_LANGS = ["en", "fr", "es", "it", "fa"]
 MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
@@ -83,20 +83,14 @@ def _profile_cache_set(user_id: str, profile: dict):
     PROFILE_CACHE[user_id] = (_now() + PROFILE_CACHE_TTL_SECONDS, profile)
 
 
-# ✅ New format: flags + no empty lines + supports "fa"
-def _build_line_text(
-    author: str,
-    original_text: str,
-    detected_language: str,
-    translations: dict,
-    ordered_langs: list[str],
-) -> str:
+# ✅ Format: flags + pas de lignes vides + support "fa"
+def _build_line_text(author: str, original_text: str, detected_language: str, translations: dict, ordered_langs: list[str]) -> str:
     flag_map = {
         "en": "🇺🇸",
         "fr": "🇫🇷",
         "es": "🇪🇸",
         "it": "🇮🇹",
-        "fa": "🇮🇷",  # ✅ Persian/Farsi (Parsi)
+        "fa": "🇮🇷",  # ✅ Persian/Farsi (Iran)
         "pt": "🇵🇹",
         "de": "🇩🇪",
         "nl": "🇳🇱",
@@ -167,6 +161,10 @@ def get_line_profile(user_id: str) -> dict:
 
 
 def reply_to_line(reply_token: str, text: str) -> bool:
+    """
+    Reply API (requiert replyToken valide). Utile en direct,
+    mais peut timeouter si le traitement est long.
+    """
     token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
     if not token or not reply_token:
         return False
@@ -178,7 +176,32 @@ def reply_to_line(reply_token: str, text: str) -> bool:
     }
     payload = {
         "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text[:4900]}],  # safety margin
+        "messages": [{"type": "text", "text": text[:4900]}],
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=10)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def push_to_line(user_id: str, text: str) -> bool:
+    """
+    PUSH API (robuste) : permet d'envoyer le message après avoir répondu 200 au webhook.
+    """
+    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+    if not token or not user_id:
+        return False
+
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "to": user_id,
+        "messages": [{"type": "text", "text": text[:4900]}],
     }
 
     try:
@@ -230,7 +253,7 @@ def translate_core(author: str, text: str, ordered_langs: list[str], include_lin
             '     "...": "..."\n'
             "  }\n"
             "}\n"
-        ),
+        )
     }
 
     resp = client.chat.completions.create(
@@ -294,38 +317,24 @@ def translate():
         return jsonify(payload), 200
 
     except json.JSONDecodeError:
-        return jsonify({"error": "internal_error", "details": "OpenAI response was not valid JSON"}), 500
+        return jsonify({
+            "error": "internal_error",
+            "details": "OpenAI response was not valid JSON",
+        }), 500
 
     except Exception as e:
-        return jsonify({"error": "internal_error", "details": str(e)}), 500
+        return jsonify({
+            "error": "internal_error",
+            "details": str(e)
+        }), 500
 
 
 # -------------------------
-# LINE WEBHOOK (POST)
+# ASYNC EVENT PROCESSOR (pour éviter timeout)
 # -------------------------
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    channel_secret = os.environ.get("LINE_CHANNEL_SECRET", "")
-    signature = request.headers.get("X-Line-Signature", "")
-
-    raw_body = request.get_data()
-
-    if not verify_line_signature(raw_body, signature, channel_secret):
-        return "Invalid signature", 400
-
-    try:
-        body = json.loads(raw_body.decode("utf-8"))
-    except Exception:
-        return "Bad request", 400
-
+def process_events(body: dict):
     events = body.get("events", []) or []
 
-    # ✅ CRITICAL: répondre tout de suite à LINE pour éviter le timeout
-    Thread(target=process_events, args=(events,)).start()
-    return "OK", 200
-
-
-def process_events(events):
     for event in events:
         try:
             if event.get("type") != "message":
@@ -335,10 +344,11 @@ def process_events(events):
             if message.get("type") != "text":
                 continue
 
-            user_id = (event.get("source", {}) or {}).get("userId", "")
-            profile = get_line_profile(user_id)
+            source = event.get("source", {}) or {}
+            user_id = source.get("userId", "")
 
-            # ✅ nickname (displayName)
+            # Nickname (displayName)
+            profile = get_line_profile(user_id)
             author = profile.get("displayName") or (f"User-{user_id[-4:]}" if user_id else "Unknown")
 
             text = (message.get("text") or "").strip()
@@ -348,11 +358,36 @@ def process_events(events):
             payload = translate_core(author, text, DEFAULT_LANGS, include_line_text=True)
             line_text = payload.get("line_text") or "Translation unavailable."
 
-            reply_token = event.get("replyToken", "")
-            reply_to_line(reply_token, line_text)
+            # ✅ PUSH (robuste, post-200)
+            push_to_line(user_id, line_text)
 
         except Exception:
             continue
+
+
+# -------------------------
+# LINE WEBHOOK (POST) - FAST ACK
+# -------------------------
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    channel_secret = os.environ.get("LINE_CHANNEL_SECRET", "")
+    signature = request.headers.get("X-Line-Signature", "")
+
+    raw_body = request.get_data()  # bytes
+
+    if not verify_line_signature(raw_body, signature, channel_secret):
+        return "Invalid signature", 400
+
+    try:
+        body = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return "Bad request", 400
+
+    # ✅ Démarre le traitement en arrière-plan
+    Thread(target=process_events, args=(body,), daemon=True).start()
+
+    # ✅ Répond 200 immédiatement à LINE (évite timeout)
+    return "OK", 200
 
 
 # -------------------------
@@ -361,4 +396,3 @@ def process_events(events):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-```0
