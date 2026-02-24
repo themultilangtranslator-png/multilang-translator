@@ -13,8 +13,8 @@ app = Flask(__name__)
 # -------------------------
 # CONFIG
 # -------------------------
-# ✅ Added Persian/Farsi (Parsi) = "fa"
-DEFAULT_LANGS = ["en", "fr", "es", "it", "fa"]
+# ✅ Active languages: English, French, Spanish, Italian, Persian(Farsi), German
+DEFAULT_LANGS = ["en", "fr", "es", "it", "fa", "de"]
 MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "86400"))  # 24h
@@ -82,7 +82,7 @@ def _profile_cache_set(user_id: str, profile: dict):
     PROFILE_CACHE[user_id] = (_now() + PROFILE_CACHE_TTL_SECONDS, profile)
 
 
-# ✅ New format: flags + no empty lines + supports "fa"
+# ✅ New format: flags + no empty lines + supports fa + de
 def _build_line_text(author: str, original_text: str, detected_language: str, translations: dict, ordered_langs: list[str]) -> str:
     flag_map = {
         "en": "🇺🇸",
@@ -90,8 +90,8 @@ def _build_line_text(author: str, original_text: str, detected_language: str, tr
         "es": "🇪🇸",
         "it": "🇮🇹",
         "fa": "🇮🇷",  # ✅ Persian/Farsi (Parsi)
+        "de": "🇩🇪",  # ✅ German
         "pt": "🇵🇹",
-        "de": "🇩🇪",
         "nl": "🇳🇱",
         "ar": "🇸🇦",
         "ja": "🇯🇵",
@@ -314,42 +314,4 @@ def webhook():
     except Exception:
         return "Bad request", 400
 
-    events = body.get("events", []) or []
-    for event in events:
-        try:
-            if event.get("type") != "message":
-                continue
-
-            message = event.get("message", {}) or {}
-            if message.get("type") != "text":
-                continue
-
-            user_id = (event.get("source", {}) or {}).get("userId", "")
-            profile = get_line_profile(user_id)
-
-            author = profile.get("displayName") or (f"User-{user_id[-4:]}" if user_id else "Unknown")
-
-            text = (message.get("text") or "").strip()
-            if not text:
-                continue
-
-            ordered_langs = DEFAULT_LANGS
-
-            payload = translate_core(author, text, ordered_langs, include_line_text=True)
-            line_text = payload.get("line_text") or "Translation unavailable."
-
-            reply_token = event.get("replyToken", "")
-            reply_to_line(reply_token, line_text)
-
-        except Exception:
-            continue
-
-    return "OK", 200
-
-
-# -------------------------
-# APP ENTRYPOINT
-# -------------------------
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    events
