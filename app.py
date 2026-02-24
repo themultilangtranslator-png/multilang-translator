@@ -5,28 +5,32 @@ import json
 import hashlib
 import hmac
 import base64
+import threading
 import requests
 from openai import OpenAI
-from threading import Thread
 
 app = Flask(__name__)
 
 # -------------------------
 # CONFIG
 # -------------------------
-# ✅ Langues actives (dont Persan/Farsi = "fa")
-DEFAULT_LANGS = ["en", "fr", "es", "it", "fa"]
+# ✅ Langues actives (ordre d'affichage)
+# Ajouts: Persian/Farsi = fa, German = de
+DEFAULT_LANGS = ["en", "fr", "es", "it", "fa", "de"]
+
 MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "86400"))  # 24h
 CACHE_MAX_ITEMS = int(os.environ.get("CACHE_MAX_ITEMS", "2000"))
 
-# Simple cache in-memory : {cache_key: (expires_at, payload_dict)}
-CACHE = {}
+CACHE = {}  # {cache_key: (expires_at, payload_dict)}
 
-# Cache profils LINE : {user_id: (expires_at, {"displayName": "...", ...})}
 PROFILE_CACHE_TTL_SECONDS = int(os.environ.get("PROFILE_CACHE_TTL_SECONDS", "86400"))  # 24h
-PROFILE_CACHE = {}
+PROFILE_CACHE = {}  # {user_id: (expires_at, profile_dict)}
+
+# UX premium
+ACK_TEXT = os.environ.get("ACK_TEXT", "⏳ Traduction en cours…")
+ACK_ENABLED = os.environ.get("ACK_ENABLED", "1") == "1"
 
 
 def _now() -> float:
@@ -57,7 +61,6 @@ def _cache_set(key: str, payload: dict):
     if CACHE_TTL_SECONDS <= 0:
         return
 
-    # Éviction simple si le cache grossit trop
     if len(CACHE) >= CACHE_MAX_ITEMS:
         cutoff = int(CACHE_MAX_ITEMS * 0.1) or 1
         for k in list(CACHE.keys())[:cutoff]:
@@ -83,16 +86,16 @@ def _profile_cache_set(user_id: str, profile: dict):
     PROFILE_CACHE[user_id] = (_now() + PROFILE_CACHE_TTL_SECONDS, profile)
 
 
-# ✅ Format: flags + pas de lignes vides + support "fa"
 def _build_line_text(author: str, original_text: str, detected_language: str, translations: dict, ordered_langs: list[str]) -> str:
+    # ✅ Flags + no empty lines
     flag_map = {
         "en": "🇺🇸",
         "fr": "🇫🇷",
         "es": "🇪🇸",
         "it": "🇮🇹",
-        "fa": "🇮🇷",  # ✅ Persian/Farsi (Iran)
+        "fa": "🇮🇷",  # Persian/Farsi
+        "de": "🇩🇪",  # German
         "pt": "🇵🇹",
-        "de": "🇩🇪",
         "nl": "🇳🇱",
         "ar": "🇸🇦",
         "ja": "🇯🇵",
@@ -114,7 +117,6 @@ def _build_line_text(author: str, original_text: str, detected_language: str, tr
         text = clean(translations.get(lang, ""))
         lines.append(f"{flag} {text}")
 
-    # IMPORTANT : pas de ligne vide, uniquement \n entre lignes utiles
     return "\n".join(lines)
 
 
@@ -131,8 +133,9 @@ def verify_line_signature(raw_body: bytes, signature: str, channel_secret: str) 
 
 def get_line_profile(user_id: str) -> dict:
     """
-    Returns LINE profile (displayName, pictureUrl, statusMessage)
+    Returns LINE profile (displayName, pictureUrl, statusMessage).
     Cached to reduce API calls.
+    NOTE: In group context, profile API works only if LINE allows it for that user/bot.
     """
     if not user_id:
         return {}
@@ -162,8 +165,7 @@ def get_line_profile(user_id: str) -> dict:
 
 def reply_to_line(reply_token: str, text: str) -> bool:
     """
-    Reply API (requiert replyToken valide). Utile en direct,
-    mais peut timeouter si le traitement est long.
+    Reply API: best for immediate ACK (uses replyToken).
     """
     token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
     if not token or not reply_token:
@@ -186,12 +188,12 @@ def reply_to_line(reply_token: str, text: str) -> bool:
         return False
 
 
-def push_to_line(user_id: str, text: str) -> bool:
+def push_to_line(to_id: str, text: str) -> bool:
     """
-    PUSH API (robuste) : permet d'envoyer le message après avoir répondu 200 au webhook.
+    Push API: sends to userId OR groupId OR roomId.
     """
     token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-    if not token or not user_id:
+    if not token or not to_id:
         return False
 
     url = "https://api.line.me/v2/bot/message/push"
@@ -200,7 +202,7 @@ def push_to_line(user_id: str, text: str) -> bool:
         "Content-Type": "application/json",
     }
     payload = {
-        "to": user_id,
+        "to": to_id,
         "messages": [{"type": "text", "text": text[:4900]}],
     }
 
@@ -284,6 +286,55 @@ def translate_core(author: str, text: str, ordered_langs: list[str], include_lin
 
 
 # -------------------------
+# ASYNC PROCESSOR (avoids webhook timeouts)
+# -------------------------
+def _process_events_async(body: dict):
+    events = body.get("events", []) or []
+
+    for event in events:
+        try:
+            if event.get("type") != "message":
+                continue
+
+            message = event.get("message", {}) or {}
+            if message.get("type") != "text":
+                continue
+
+            source = event.get("source", {}) or {}
+            source_type = source.get("type", "user")
+
+            # ✅ Destination = where we push final translation
+            to_id = None
+            if source_type == "group":
+                to_id = source.get("groupId")
+            elif source_type == "room":
+                to_id = source.get("roomId")
+            else:
+                to_id = source.get("userId")
+
+            user_id = source.get("userId", "")
+            profile = get_line_profile(user_id)
+
+            # ✅ Nickname when available
+            author = profile.get("displayName") or (f"User-{user_id[-4:]}" if user_id else "Unknown")
+
+            text = (message.get("text") or "").strip()
+            if not text:
+                continue
+
+            ordered_langs = DEFAULT_LANGS
+
+            payload = translate_core(author, text, ordered_langs, include_line_text=True)
+            line_text = payload.get("line_text") or "Translation unavailable."
+
+            # ✅ Push final translation into the SAME channel (group/room/user)
+            push_to_line(to_id, line_text)
+
+        except Exception:
+            continue
+
+
+# -------------------------
 # HEALTH CHECK
 # -------------------------
 @app.route("/", methods=["GET"])
@@ -308,65 +359,19 @@ def translate():
     if not isinstance(languages, list) or not all(isinstance(x, str) for x in languages):
         return jsonify({"error": "languages must be a list of strings"}), 400
 
-    ordered_langs = [x.strip() for x in languages if x and x.strip()]
-    if not ordered_langs:
-        ordered_langs = DEFAULT_LANGS
+    ordered_langs = [x.strip() for x in languages if x and x.strip()] or DEFAULT_LANGS
 
     try:
         payload = translate_core(author, text, ordered_langs, include_line_text=include_line_text)
         return jsonify(payload), 200
-
     except json.JSONDecodeError:
-        return jsonify({
-            "error": "internal_error",
-            "details": "OpenAI response was not valid JSON",
-        }), 500
-
+        return jsonify({"error": "internal_error", "details": "OpenAI response was not valid JSON"}), 500
     except Exception as e:
-        return jsonify({
-            "error": "internal_error",
-            "details": str(e)
-        }), 500
+        return jsonify({"error": "internal_error", "details": str(e)}), 500
 
 
 # -------------------------
-# ASYNC EVENT PROCESSOR (pour éviter timeout)
-# -------------------------
-def process_events(body: dict):
-    events = body.get("events", []) or []
-
-    for event in events:
-        try:
-            if event.get("type") != "message":
-                continue
-
-            message = event.get("message", {}) or {}
-            if message.get("type") != "text":
-                continue
-
-            source = event.get("source", {}) or {}
-            user_id = source.get("userId", "")
-
-            # Nickname (displayName)
-            profile = get_line_profile(user_id)
-            author = profile.get("displayName") or (f"User-{user_id[-4:]}" if user_id else "Unknown")
-
-            text = (message.get("text") or "").strip()
-            if not text:
-                continue
-
-            payload = translate_core(author, text, DEFAULT_LANGS, include_line_text=True)
-            line_text = payload.get("line_text") or "Translation unavailable."
-
-            # ✅ PUSH (robuste, post-200)
-            push_to_line(user_id, line_text)
-
-        except Exception:
-            continue
-
-
-# -------------------------
-# LINE WEBHOOK (POST) - FAST ACK
+# LINE WEBHOOK (POST)
 # -------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -374,7 +379,6 @@ def webhook():
     signature = request.headers.get("X-Line-Signature", "")
 
     raw_body = request.get_data()  # bytes
-
     if not verify_line_signature(raw_body, signature, channel_secret):
         return "Invalid signature", 400
 
@@ -383,10 +387,20 @@ def webhook():
     except Exception:
         return "Bad request", 400
 
-    # ✅ Démarre le traitement en arrière-plan
-    Thread(target=process_events, args=(body,), daemon=True).start()
+    # ✅ Immediate ACK (replyToken) to prevent timeout & improve UX
+    if ACK_ENABLED:
+        try:
+            events = body.get("events", []) or []
+            for event in events:
+                reply_token = event.get("replyToken", "")
+                if reply_token:
+                    reply_to_line(reply_token, ACK_TEXT)
+        except Exception:
+            pass
 
-    # ✅ Répond 200 immédiatement à LINE (évite timeout)
+    # ✅ Async processing: return 200 FAST, do heavy work in background
+    threading.Thread(target=_process_events_async, args=(body,), daemon=True).start()
+
     return "OK", 200
 
 
