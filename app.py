@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import base64
 import requests
+from threading import Thread
 from openai import OpenAI
 
 app = Flask(__name__)
@@ -13,7 +14,7 @@ app = Flask(__name__)
 # -------------------------
 # CONFIG
 # -------------------------
-# ✅ Active languages (default): EN, FR, ES, IT, FA
+# ✅ Added Persian/Farsi (Parsi) = "fa"
 DEFAULT_LANGS = ["en", "fr", "es", "it", "fa"]
 MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
@@ -82,7 +83,7 @@ def _profile_cache_set(user_id: str, profile: dict):
     PROFILE_CACHE[user_id] = (_now() + PROFILE_CACHE_TTL_SECONDS, profile)
 
 
-# ✅ LINE text formatter: flags + no empty lines
+# ✅ New format: flags + no empty lines + supports "fa"
 def _build_line_text(
     author: str,
     original_text: str,
@@ -119,7 +120,7 @@ def _build_line_text(
         text = clean(translations.get(lang, ""))
         lines.append(f"{flag} {text}")
 
-    # IMPORTANT: no blank lines, only one \n between useful lines
+    # IMPORTANT : pas de ligne vide, uniquement \n entre lignes utiles
     return "\n".join(lines)
 
 
@@ -229,7 +230,7 @@ def translate_core(author: str, text: str, ordered_langs: list[str], include_lin
             '     "...": "..."\n'
             "  }\n"
             "}\n"
-        )
+        ),
     }
 
     resp = client.chat.completions.create(
@@ -293,16 +294,10 @@ def translate():
         return jsonify(payload), 200
 
     except json.JSONDecodeError:
-        return jsonify({
-            "error": "internal_error",
-            "details": "OpenAI response was not valid JSON",
-        }), 500
+        return jsonify({"error": "internal_error", "details": "OpenAI response was not valid JSON"}), 500
 
     except Exception as e:
-        return jsonify({
-            "error": "internal_error",
-            "details": str(e)
-        }), 500
+        return jsonify({"error": "internal_error", "details": str(e)}), 500
 
 
 # -------------------------
@@ -313,7 +308,8 @@ def webhook():
     channel_secret = os.environ.get("LINE_CHANNEL_SECRET", "")
     signature = request.headers.get("X-Line-Signature", "")
 
-    raw_body = request.get_data()  # bytes
+    raw_body = request.get_data()
+
     if not verify_line_signature(raw_body, signature, channel_secret):
         return "Invalid signature", 400
 
@@ -322,9 +318,14 @@ def webhook():
     except Exception:
         return "Bad request", 400
 
-    # ✅ FIX: define events before using it
     events = body.get("events", []) or []
 
+    # ✅ CRITICAL: répondre tout de suite à LINE pour éviter le timeout
+    Thread(target=process_events, args=(events,)).start()
+    return "OK", 200
+
+
+def process_events(events):
     for event in events:
         try:
             if event.get("type") != "message":
@@ -337,5 +338,27 @@ def webhook():
             user_id = (event.get("source", {}) or {}).get("userId", "")
             profile = get_line_profile(user_id)
 
-            # ✅ Nickname (displayName)
-            author = profile.get("displayName")
+            # ✅ nickname (displayName)
+            author = profile.get("displayName") or (f"User-{user_id[-4:]}" if user_id else "Unknown")
+
+            text = (message.get("text") or "").strip()
+            if not text:
+                continue
+
+            payload = translate_core(author, text, DEFAULT_LANGS, include_line_text=True)
+            line_text = payload.get("line_text") or "Translation unavailable."
+
+            reply_token = event.get("replyToken", "")
+            reply_to_line(reply_token, line_text)
+
+        except Exception:
+            continue
+
+
+# -------------------------
+# APP ENTRYPOINT
+# -------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+```0
