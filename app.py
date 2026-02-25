@@ -16,8 +16,7 @@ app = Flask(__name__)
 # -------------------------
 # CONFIG
 # -------------------------
-# Langues actives (ordre d’affichage)
-DEFAULT_LANGS = ["en", "fr", "es", "it", "fa", "de"]  # ✅ English, French, Spanish, Italian, Persian(Farsi), German
+DEFAULT_LANGS = ["en", "fr", "es", "it", "fa", "de"]
 MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "86400"))  # 24h
@@ -25,7 +24,6 @@ CACHE_MAX_ITEMS = int(os.environ.get("CACHE_MAX_ITEMS", "2000"))
 
 PROFILE_CACHE_TTL_SECONDS = int(os.environ.get("PROFILE_CACHE_TTL_SECONDS", "86400"))  # 24h
 
-# Caches in-memory
 CACHE = {}          # {cache_key: (expires_at, payload_dict)}
 PROFILE_CACHE = {}  # {user_id: (expires_at, profile_dict)}
 
@@ -61,7 +59,6 @@ def _cache_set(key: str, payload: dict):
     if CACHE_TTL_SECONDS <= 0:
         return
 
-    # Eviction simple si trop gros
     if len(CACHE) >= CACHE_MAX_ITEMS:
         cutoff = int(CACHE_MAX_ITEMS * 0.1) or 1
         for k in list(CACHE.keys())[:cutoff]:
@@ -120,7 +117,6 @@ def _build_line_text(author: str, original_text: str, detected_language: str, tr
         text = clean(translations.get(lang, ""))
         lines.append(f"{flag} {text}")
 
-    # ✅ aucun “trou” : uniquement \n entre lignes utiles
     return "\n".join(lines)
 
 
@@ -136,11 +132,6 @@ def verify_line_signature(raw_body: bytes, signature: str, channel_secret: str) 
 
 
 def get_line_profile(user_id: str) -> dict:
-    """
-    Retourne le profil LINE (displayName, pictureUrl, statusMessage)
-    ou {} si impossible. Cache pour limiter les appels.
-    Note: le profile endpoint marche surtout si l’utilisateur a ajouté le bot en ami.
-    """
     if not user_id:
         return {}
 
@@ -168,7 +159,6 @@ def get_line_profile(user_id: str) -> dict:
 
 
 def reply_to_line(reply_token: str, text: str) -> bool:
-    """Répond via replyToken (réponse dans le même chat où le message a été posté)."""
     token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
     if not token or not reply_token:
         return False
@@ -182,13 +172,15 @@ def reply_to_line(reply_token: str, text: str) -> bool:
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=10)
+        if r.status_code != 200:
+            print("REPLY FAILED:", r.status_code, r.text)
         return r.status_code == 200
-    except Exception:
+    except Exception as e:
+        print("REPLY EXCEPTION:", str(e))
         return False
 
 
 def push_to_line(to_id: str, text: str) -> bool:
-    """Envoie un message dans un group/room/user via push API."""
     token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
     if not token or not to_id:
         return False
@@ -202,8 +194,11 @@ def push_to_line(to_id: str, text: str) -> bool:
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=10)
+        if r.status_code != 200:
+            print("PUSH FAILED:", r.status_code, r.text)
         return r.status_code == 200
-    except Exception:
+    except Exception as e:
+        print("PUSH EXCEPTION:", str(e))
         return False
 
 
@@ -293,7 +288,7 @@ def health_check():
 
 
 # -------------------------
-# TRANSLATE (POST) - API TEST
+# API TEST
 # -------------------------
 @app.route("/translate", methods=["POST"])
 def translate():
@@ -314,34 +309,33 @@ def translate():
     try:
         payload = translate_core(author, text, ordered_langs, include_line_text=include_line_text)
         return jsonify(payload), 200
-
     except json.JSONDecodeError:
         return jsonify({"error": "internal_error", "details": "OpenAI response was not valid JSON"}), 500
-
     except Exception as e:
         return jsonify({"error": "internal_error", "details": str(e)}), 500
 
 
 # -------------------------
-# ASYNC WORKER (critical for LINE timeouts)
+# ASYNC WORKER
 # -------------------------
 def _process_event_async(reply_token: str, to_id: str, author: str, text: str):
     try:
-        # 1) ACK immédiat dans le bon canal (group/room/private) via replyToken
-        reply_to_line(reply_token, "⏳ Traduction en cours…")
-
-        # 2) Traduction
+        # Traduire
         line_text = translate_text(author, text)
 
-        # 3) Push résultat dans le canal d’origine (group/room/private)
-        push_to_line(to_id, line_text)
+        # 1) Essayer de répondre via replyToken (dans le même chat)
+        ok = reply_to_line(reply_token, line_text)
+
+        # 2) Fallback push si replyToken expiré / reply fail
+        if not ok:
+            push_to_line(to_id, line_text)
 
     except Exception:
         print("ASYNC ERROR:", traceback.format_exc())
 
 
 # -------------------------
-# LINE WEBHOOK (POST)
+# LINE WEBHOOK
 # -------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -370,7 +364,7 @@ def webhook():
             source = event.get("source", {}) or {}
             source_type = source.get("type", "")
 
-            # ✅ Destination = le canal où le message a été posté
+            # Destination (group/room/user)
             if source_type == "group":
                 to_id = source.get("groupId", "")
             elif source_type == "room":
@@ -390,7 +384,7 @@ def webhook():
             if not text:
                 continue
 
-            # ✅ CRITICAL: on lance en thread et on répond 200 tout de suite à LINE
+            # Thread (200 OK immédiat)
             t = threading.Thread(
                 target=_process_event_async,
                 args=(reply_token, to_id, author, text),
@@ -402,12 +396,11 @@ def webhook():
             print("WEBHOOK EVENT ERROR:", traceback.format_exc())
             continue
 
-    # ✅ Réponse HTTP immédiate => fini les timeouts + Verify OK
     return "OK", 200
 
 
 # -------------------------
-# APP ENTRYPOINT
+# ENTRYPOINT
 # -------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
