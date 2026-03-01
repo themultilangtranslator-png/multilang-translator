@@ -7,8 +7,6 @@ import hashlib
 import hmac
 import base64
 import requests
-import threading
-import traceback
 from openai import OpenAI
 
 app = Flask(__name__)
@@ -16,6 +14,7 @@ app = Flask(__name__)
 # -------------------------
 # CONFIG
 # -------------------------
+# Langues actives (ordre d’affichage)
 DEFAULT_LANGS = ["en", "fr", "es", "it", "fa", "de"]
 MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
@@ -24,6 +23,7 @@ CACHE_MAX_ITEMS = int(os.environ.get("CACHE_MAX_ITEMS", "2000"))
 
 PROFILE_CACHE_TTL_SECONDS = int(os.environ.get("PROFILE_CACHE_TTL_SECONDS", "86400"))  # 24h
 
+# Caches in-memory
 CACHE = {}          # {cache_key: (expires_at, payload_dict)}
 PROFILE_CACHE = {}  # {user_id: (expires_at, profile_dict)}
 
@@ -35,7 +35,7 @@ def _now() -> float:
     return time.time()
 
 
-def _make_cache_key(author: str, text: str, languages: list[str]) -> str:
+def _make_cache_key(author: str, text: str, languages: list) -> str:
     raw = json.dumps(
         {"author": author, "text": text, "languages": languages},
         ensure_ascii=False,
@@ -59,6 +59,7 @@ def _cache_set(key: str, payload: dict):
     if CACHE_TTL_SECONDS <= 0:
         return
 
+    # Éviction simple si le cache grossit trop
     if len(CACHE) >= CACHE_MAX_ITEMS:
         cutoff = int(CACHE_MAX_ITEMS * 0.1) or 1
         for k in list(CACHE.keys())[:cutoff]:
@@ -87,21 +88,23 @@ def _profile_cache_set(user_id: str, profile: dict):
 # -------------------------
 # OUTPUT FORMAT (no empty lines)
 # -------------------------
-def _build_line_text(author: str, original_text: str, detected_language: str, translations: dict, ordered_langs: list[str]) -> str:
-    flag_map = {
-        "en": "🇺🇸",
-        "fr": "🇫🇷",
-        "es": "🇪🇸",
-        "it": "🇮🇹",
-        "fa": "🇮🇷",
-        "de": "🇩🇪",
-        "pt": "🇵🇹",
-        "nl": "🇳🇱",
-        "ar": "🇸🇦",
-        "ja": "🇯🇵",
-        "ko": "🇰🇷",
-        "zh": "🇨🇳",
-        "ru": "🇷🇺",
+def _build_line_text(author: str, original_text: str, detected_language: str,
+                     translations: dict, ordered_langs: list) -> str:
+    # Remplacer drapeaux par noms de langues
+    lang_label = {
+        "en": "ENGLISH",
+        "fr": "FRANÇAIS",
+        "es": "ESPAÑOL",
+        "it": "ITALIANO",
+        "fa": "فارسی",
+        "de": "DEUTSCH",
+        "pt": "PORTUGUÊS",
+        "nl": "NEDERLANDS",
+        "ar": "العربية",
+        "ja": "日本語",
+        "ko": "한국어",
+        "zh": "中文",
+        "ru": "РУССКИЙ",
     }
 
     def clean(s: str) -> str:
@@ -113,11 +116,35 @@ def _build_line_text(author: str, original_text: str, detected_language: str, tr
     lines.append(f"📝 {clean(original_text)}")
 
     for lang in ordered_langs:
-        flag = flag_map.get(lang.lower(), f"🏳️({lang})")
+        code = (lang or "").strip().lower()
+        label = lang_label.get(code, code.upper() if code else "LANG")
         text = clean(translations.get(lang, ""))
-        lines.append(f"{flag} {text}")
+        lines.append(f"{label}: {text}")
 
     return "\n".join(lines)
+
+
+def _chunk_text(s: str, max_len: int = 1100) -> list:
+    """
+    Découpe un texte en morceaux "safe" pour LINE.
+    Coupe en priorité sur \n, sinon coupe brute.
+    """
+    s = (s or "").strip()
+    if not s:
+        return []
+
+    chunks = []
+    while len(s) > max_len:
+        cut = s.rfind("\n", 0, max_len)
+        if cut < 200:  # pas de bon \n, coupe brute
+            cut = max_len
+        chunks.append(s[:cut].strip())
+        s = s[cut:].strip()
+
+    if s:
+        chunks.append(s)
+
+    return chunks
 
 
 # -------------------------
@@ -132,6 +159,10 @@ def verify_line_signature(raw_body: bytes, signature: str, channel_secret: str) 
 
 
 def get_line_profile(user_id: str) -> dict:
+    """
+    Returns LINE profile (displayName, pictureUrl, statusMessage).
+    Cached to reduce API calls.
+    """
     if not user_id:
         return {}
 
@@ -159,59 +190,69 @@ def get_line_profile(user_id: str) -> dict:
 
 
 def reply_to_line(reply_token: str, text: str) -> bool:
+    """
+    Répond dans le même chat via replyToken.
+    - 1 seul message si le texte est court
+    - Plusieurs messages si trop long (chunking)
+    """
     token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
     if not token or not reply_token:
         return False
 
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {
-        "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text[:4900]}],
-    }
+
+    text = (text or "").strip()
+
+    # Seuil sécurité : on reste conservateur
+    SAFE_LIMIT = 1500
+
+    if len(text) <= SAFE_LIMIT:
+        payload = {
+            "replyToken": reply_token,
+            "messages": [{"type": "text", "text": text}],
+        }
+    else:
+        parts = _chunk_text(text, max_len=1100)
+
+        # Limite courante de messages par reply (souvent 5)
+        if not parts:
+            parts = ["Translation unavailable."]
+        parts = parts[:5]
+
+        payload = {
+            "replyToken": reply_token,
+            "messages": [{"type": "text", "text": p} for p in parts],
+        }
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=10)
-        if r.status_code != 200:
-            print("REPLY FAILED:", r.status_code, r.text)
         return r.status_code == 200
-    except Exception as e:
-        print("REPLY EXCEPTION:", str(e))
-        return False
-
-
-def push_to_line(to_id: str, text: str) -> bool:
-    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-    if not token or not to_id:
-        return False
-
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {
-        "to": to_id,
-        "messages": [{"type": "text", "text": text[:4900]}],
-    }
-
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=10)
-        if r.status_code != 200:
-            print("PUSH FAILED:", r.status_code, r.text)
-        return r.status_code == 200
-    except Exception as e:
-        print("PUSH EXCEPTION:", str(e))
+    except Exception:
         return False
 
 
 # -------------------------
 # OPENAI TRANSLATION CORE
 # -------------------------
-def translate_core(author: str, text: str, ordered_langs: list[str], include_line_text: bool = True) -> dict:
+def _safe_json_load(s: str) -> dict:
+    """
+    Parse JSON. If invalid, returns {}.
+    """
+    try:
+        return json.loads(s)
+    except Exception:
+        return {}
+
+
+def translate_core(author: str, text: str, ordered_langs: list, include_line_text: bool = True) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set")
 
     client = OpenAI(api_key=api_key)
 
+    # Cache (author+text+langs)
     cache_key = _make_cache_key(author, text, ordered_langs)
     cached = _cache_get(cache_key)
     if cached:
@@ -254,10 +295,14 @@ def translate_core(author: str, text: str, ordered_langs: list[str], include_lin
     )
     raw = (resp.choices[0].message.content or "").strip()
 
-    result = json.loads(raw)
+    result = _safe_json_load(raw)
+
     detected_language = str(result.get("detected_language", "unknown")).strip()
     translations = result.get("translations", {}) or {}
+    if not isinstance(translations, dict):
+        translations = {}
 
+    # Assure ordre + clés
     ordered_translations = {lang: str(translations.get(lang, "")).strip() for lang in ordered_langs}
 
     payload = {
@@ -274,11 +319,6 @@ def translate_core(author: str, text: str, ordered_langs: list[str], include_lin
     return payload
 
 
-def translate_text(author: str, text: str) -> str:
-    payload = translate_core(author, text, DEFAULT_LANGS, include_line_text=True)
-    return payload.get("line_text") or "Translation unavailable."
-
-
 # -------------------------
 # HEALTH CHECK
 # -------------------------
@@ -288,7 +328,7 @@ def health_check():
 
 
 # -------------------------
-# API TEST
+# TRANSLATE (POST) - API TEST
 # -------------------------
 @app.route("/translate", methods=["POST"])
 def translate():
@@ -304,45 +344,26 @@ def translate():
     if not isinstance(languages, list) or not all(isinstance(x, str) for x in languages):
         return jsonify({"error": "languages must be a list of strings"}), 400
 
-    ordered_langs = [x.strip() for x in languages if x and x.strip()] or DEFAULT_LANGS
+    ordered_langs = [x.strip() for x in languages if x and x.strip()]
+    if not ordered_langs:
+        ordered_langs = DEFAULT_LANGS
 
     try:
         payload = translate_core(author, text, ordered_langs, include_line_text=include_line_text)
         return jsonify(payload), 200
-    except json.JSONDecodeError:
-        return jsonify({"error": "internal_error", "details": "OpenAI response was not valid JSON"}), 500
     except Exception as e:
         return jsonify({"error": "internal_error", "details": str(e)}), 500
 
 
 # -------------------------
-# ASYNC WORKER
-# -------------------------
-def _process_event_async(reply_token: str, to_id: str, author: str, text: str):
-    try:
-        # Traduire
-        line_text = translate_text(author, text)
-
-        # 1) Essayer de répondre via replyToken (dans le même chat)
-        ok = reply_to_line(reply_token, line_text)
-
-        # 2) Fallback push si replyToken expiré / reply fail
-        if not ok:
-            push_to_line(to_id, line_text)
-
-    except Exception:
-        print("ASYNC ERROR:", traceback.format_exc())
-
-
-# -------------------------
-# LINE WEBHOOK
+# LINE WEBHOOK (POST)
 # -------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    raw_body = request.get_data()
-    signature = request.headers.get("X-Line-Signature", "")
     channel_secret = os.environ.get("LINE_CHANNEL_SECRET", "")
+    signature = request.headers.get("X-Line-Signature", "")
 
+    raw_body = request.get_data()  # bytes
     if not verify_line_signature(raw_body, signature, channel_secret):
         return "Invalid signature", 400
 
@@ -362,45 +383,32 @@ def webhook():
                 continue
 
             source = event.get("source", {}) or {}
-            source_type = source.get("type", "")
-
-            # Destination (group/room/user)
-            if source_type == "group":
-                to_id = source.get("groupId", "")
-            elif source_type == "room":
-                to_id = source.get("roomId", "")
-            else:
-                to_id = source.get("userId", "")
-
-            reply_token = event.get("replyToken", "")
-            if not reply_token or not to_id:
-                continue
-
             user_id = source.get("userId", "")
             profile = get_line_profile(user_id)
+
+            # Nickname si dispo
             author = profile.get("displayName") or (f"User-{user_id[-4:]}" if user_id else "Unknown")
 
             text = (message.get("text") or "").strip()
             if not text:
                 continue
 
-            # Thread (200 OK immédiat)
-            t = threading.Thread(
-                target=_process_event_async,
-                args=(reply_token, to_id, author, text),
-                daemon=True
-            )
-            t.start()
+            payload = translate_core(author, text, DEFAULT_LANGS, include_line_text=True)
+            line_text = payload.get("line_text") or "Translation unavailable."
+
+            reply_token = event.get("replyToken", "")
+            if reply_token:
+                reply_to_line(reply_token, line_text)
 
         except Exception:
-            print("WEBHOOK EVENT ERROR:", traceback.format_exc())
+            # Ne bloque pas le traitement des autres events
             continue
 
     return "OK", 200
 
 
 # -------------------------
-# ENTRYPOINT
+# APP ENTRYPOINT
 # -------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
